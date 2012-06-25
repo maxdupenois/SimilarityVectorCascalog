@@ -1,0 +1,615 @@
+(ns SimilarityVectorCascalog.core
+   (:use cascalog.api 
+	cascalog.checkpoint
+	cascalog.more-taps)
+   (:require 
+	[cascalog [vars :as v] [ops :as c]]
+	[clojure.string :as cs]
+	[cascalog.util :as u]
+	[cascalog.workflow :as w]
+	[hadoop-util.core :as hdp]
+	)
+   (:import 
+	[cascading.tap GlobHfs]
+	[cascading.tuple Fields])
+   (:gen-class))
+	
+
+
+(defmapcatop split [sentence]
+	(seq (.split sentence "\\s")))
+	
+(defmapop extract [cols pattern string]
+	(take cols (re-seq pattern string))
+	)
+(defmapop make-date [year month day]
+	(cs/join "-" [year month day])
+	)
+
+(defmapop to-int [x]
+	(Integer/parseInt x)
+	)	
+(defmapop to-double [x]
+	(Double/parseDouble x)
+	)
+
+
+(deffilterop no-repeats [word]
+	(nil? (re-find (re-matcher #"(.)\1{2,}" word))))
+(deffilterop valid-word [word]
+	(nil? (re-find (re-matcher #"^[^a-z]" word))))
+
+
+(deffilterop valid-length [word]
+	(> (.length word) 2))
+
+
+(defn read-from-totals [location]
+	(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+	(let [src (hfs-textline location)]
+		(<- [?date ?total] (src ?line) (extract 2 #"[^\t]+" ?line :> ?date ?total) )
+	))
+)
+	
+(defn read-from-partial-word-vec [location]
+	(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+	(let [src (hfs-textline location)]
+		(<- [?date ?word ?count] (src ?line) (extract 3 #"[^\t]+" ?line :> ?date ?word ?count) )
+	))
+)
+
+(defn read-from-word-vec [pth]
+	(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+	(let [src (hfs-textline pth)]
+		(<- [?date ?word ?count ?norm ?sum] (src ?line) (extract 5 #"[^\t]+" ?line :> ?date ?word ?count ?norm ?sum) )
+	))
+)
+
+(defn split-tweet-loc  [tweet-loc]
+	 (seq (.split tweet-loc ","))
+)
+
+(defn globhfs-textfile [pattern]
+	
+	(hfs-textline "" :source-pattern (str "/user/hive/warehouse/twitter_moods/dated=" pattern "/mood*"))
+)
+
+
+
+(defn create-partial-vector [tweet-loc output]	
+	(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+	(let [source (globhfs-textfile tweet-loc)]
+		 	(let [word-vec (<- [?date-word ?count] (source ?line) (extract 7 #"[^\t]+" ?line  :> ?year ?month ?day _ _ _ ?tweet)
+				(make-date ?year ?month ?day :> ?date)
+				(split ?tweet :> ?word)
+				(cs/lower-case ?word :> ?word)
+				(cs/replace ?word #"[^a-z\-\_]" "" :> ?word)
+				(str ?date "|" ?word :> ?date-word)
+				(no-repeats ?word)
+				(valid-word ?word)
+				(valid-length ?word)
+				(c/count ?count))
+			] 
+			(?<- (hfs-textline output) [?out-line] (word-vec ?date-word ?count) (extract 2 #"[^\|]+" ?date-word :> ?date ?word) (str ?date "\t" ?word "\t" ?count :> ?out-line))
+		)
+	))
+)
+(defn compute-date-word-total [vector-path output]
+	(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+	(let [word_vec (hfs-textline vector-path)]
+		(let [sums 	(<- [?date ?sum] (word_vec ?line) (extract 3 #"[^\t]+" ?line :> ?date _ ?count) (to-int ?count :> ?icount) (c/sum ?icount :> ?sum))]
+		(?<- (hfs-textline output) [?out-line] (sums ?date ?sum)  (str ?date "\t" ?sum :> ?out-line))
+		)
+	))
+)
+(defn combine-into-true-word-vector [vector-path sum-path output]
+		(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+			(let [word-vec (read-from-partial-word-vec vector-path)]
+				(let [date-sums (read-from-totals sum-path)]
+					(let [true-vec 	(<- [?date ?word ?count ?norm ?sum] 
+						(word-vec ?date ?word ?count)
+						(date-sums ?date ?sum)
+						(to-int ?count :> ?icount)
+						(to-int ?sum :> ?isum)
+						(div ?icount ?isum :> ?norm)	
+						)]
+						(?<- (hfs-textline output) [?out-line] 
+						(true-vec ?date ?word ?count ?norm ?sum)	
+						(str ?date "\t" ?word "\t" ?count "\t" ?norm "\t" ?sum :> ?out-line))
+					)
+				)
+			))
+	)
+
+
+(defn hdp-path-exists? [pth]
+	(hdp/path-exists? (hdp/filesystem) (hdp/path pth))
+)
+(defn build-tweet-vector [tweet-loc word-vector-loc]
+	(println (str "**Building tweet word vectors into " word-vector-loc " from " tweet-loc))
+	(workflow ["/tmp/max/twitter_vector_tmp"]
+		stage-1 ([:tmp-dirs partial-tweet-vector-step]
+			(create-partial-vector tweet-loc partial-tweet-vector-step)
+			)
+		stage-2 ([:tmp-dirs date-word-sums]
+			(compute-date-word-total partial-tweet-vector-step date-word-sums) ;At some point this can be replaced with a ??-
+			)
+		stage-3 ([:deps [stage-1 stage-2]]
+			(combine-into-true-word-vector partial-tweet-vector-step date-word-sums word-vector-loc)
+			)		
+	)
+)
+
+(defaggregateop combine-norms 
+	([] [])
+	([norms norm] (conj norms norm))
+	([norms] [norms])
+)
+; (defn get-vector-val [?date]
+; 	 (c/sum ?norm)
+; 	)
+
+(defmapop true-norm [n]
+	(if (nil? n) 
+	(identity "0.0") 
+	(identity n))
+)
+
+
+(defn words-for-dates [word-vec]
+(let [
+	words (<- [?dummy ?w] (word-vec _ ?w _ _ _) (identity 1 :> ?dummy))
+	dates (<- [?dummy ?d] (word-vec ?d _ _ _ _) (identity 1 :> ?dummy))
+	]
+	(<- [!!w !!d] (words ?dummy !!w) (dates ?dummy !!d) )
+)
+)
+	
+
+(defn fill-zeroes [word-vec]
+	(<- [?word ?date ?norm] ((words-for-dates word-vec) ?word ?date)  
+	(word-vec ?date ?word _ !!n _) 
+	(true-norm !!n :> ?norm))
+)
+(defn to-double-fn [x]
+	(Double/parseDouble x)
+	)
+
+; (defn magnitude[v]
+; 	(Math/sqrt (reduce + (map * v v)))
+; 	)
+; (defmapop cosine-similarity [curr-norms prev-norms]
+; 	(let [
+; 		curr  (map to-double-fn (seq (.split curr-norms "\\|")))
+; 		prev  (map to-double-fn (seq (.split prev-norms "\\|")))
+; 		
+; 	]
+; 		(div (reduce + (map * curr prev)) (* (magnitude curr) (magnitude prev)))
+; 	) 
+; )
+
+
+(defparallelagg join-norms :init-var #'identity :combine-var #'combine-norms)
+(defn combine-norms[norms norm] (str norms "|" norm))
+
+(def i 0)
+(def n 0)
+(defmapop get-i [d]
+	(def i (+ i 1))
+	(identity i)
+)
+(defmapop get-n [d]
+	(def n (+ n 1))
+	(identity n)
+)
+(defn index-dates[dates]
+	(def n 0)
+	(<- [?d ?i] (dates ?d) (get-n ?d :> ?i))
+)
+(defn index-dates-lagged[dates]
+	(def i 0)
+	(<- [?d ?i] (dates ?d) (get-i ?d :> ?i))
+)
+
+(defn init-magnitude [v] (* v v))
+; (defn combine-magnitude [current v] (+ current (* v v)))
+(defparallelagg magnitude-sq :init-var #'init-magnitude :combine-var #'+)
+
+; (defn init-dot-product [str-tuple] 
+; 	(let [tuple  (take 2 (re-seq #"[^\|]+" str-tuple))
+; 		val1 (to-double-fn (first tuple))
+; 		val2 (to-double-fn (second tuple))
+; 	]
+; 		(* val1 val2)
+; 	)
+; )
+(defn init-dot-product [val1 val2] 
+	(* val1 val2)
+)
+
+(defparallelagg dot-product :init-var #'init-dot-product :combine-var #'+)
+; (defmapop tuplerise [v1 v2]  (str v1 "|" v2) )
+
+; (defaggregateop testthing
+; 	([] "")
+; 	([curr nxt] (str curr "|" nxt))
+; 	([curr] [curr])
+; 	)
+
+; (def vec1 [
+; 	["a" 1.1]
+; 	["a" 1.2]
+; 	["a" 1.3]
+; 	["b" 1.4]
+; 	["b" 1.5]
+; 	])
+; (def vec2 [
+; 	["a" 2.1]
+; 	["a" 3.2]
+; 	["b" 2.3]
+; 	["a" 2.4]
+; 	["b" 2.5]
+; 	])
+
+; (?<- (stdout) [?key ?dp] (vec1 ?key ?v1) (tuplerise ?v1 ?v2 :> ?tuple))
+; 
+; (?<- (stdout) [?dp] (vec1 ?v1 ?v2) (str ?v1 "|" ?v2 :> ?t) (testthing ?t :> ?dp))
+
+(defmapop cosine-sim [dot-prod mag-vector1 mag-vector2]
+	(div dot-prod (* mag-vector1 mag-vector2))
+	)
+(defmapop sqrt[v] (Math/sqrt v))
+(defn -main [tweet-loc friendlyname]
+	(println (str "**Running tweet similarity workflow on " friendlyname ))
+	(let [
+		word-vector-loc (str "/user/maxdupenois/twitter-word-vectors/dated=" friendlyname)
+		similarities-loc (str "/user/maxdupenois/twitter-similarities/dated=" friendlyname)
+		true-word-vec (str "/user/maxdupenois/twitter-similarities/tmp/twitter-word-vectors/dated=" friendlyname)
+		date-to-prev-date (str "/user/maxdupenois/twitter-similarities/tmp/date-to-prev-date/dated=" friendlyname)
+		matrix-loc (str "/user/maxdupenois/twitter-similarities/tmp/matrix-loc/dated=" friendlyname)
+		]
+		(if  (not (hdp-path-exists? word-vector-loc)) 
+			(build-tweet-vector tweet-loc word-vector-loc)
+		)
+		(if  (not (hdp-path-exists? true-word-vec))
+			(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+			(let [word-vec (read-from-word-vec word-vector-loc)]
+				(?<- (hfs-textline true-word-vec) [?outline] ((fill-zeroes word-vec) ?word ?date ?norm) 
+				(str ?word "\t" ?date "\t" ?norm :> ?outline))
+			)
+			)
+		)
+		(if  (not (hdp-path-exists? date-to-prev-date))
+			(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+				(let [
+					word-vec (read-from-word-vec word-vector-loc)
+					dates (<- [?d] (word-vec ?d _ _ _ _) )
+					dummy-partial (<-  [?blank] ([" "] ?blank))
+					dates-lagged (union dates dummy-partial)
+					dates-lagged-indexed (index-dates-lagged dates-lagged)
+					dates-indexed (index-dates dates)
+					]
+					(?<- (hfs-textline date-to-prev-date) [?d1 ?d2] (dates-indexed ?d1 ?i) (dates-lagged-indexed ?d2 ?i))
+				)
+			)
+		)
+		(if  (not (hdp-path-exists? matrix-loc))
+			(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+				(let [word-vec (hfs-textline true-word-vec)] ;"/user/maxdupenois/test-template"
+					(?<- (hfs-textline matrix-loc :outfields ["?word" "?norm"] :templatefields "?date" :sink-template "%s") 
+					[?date ?word ?norm] (word-vec ?line)
+					(extract 3 #"[^\t]+" ?line :> ?word ?date ?norm)) 
+				)
+			)
+		)
+		; Okay, all the norms have been dumped into files within matrix-loc directory named by date
+		; need to loop through all dates and their previous so:
+		; date-to-prev (??<- [?date ?prev] ((hfs-textline date-to-prev-date) ?line) (extract 2 #"[^\t]+" ?line :> ?date ?prev))
+		(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+		(let [
+			date-to-prev (??<- [?date ?prev] ((hfs-textline date-to-prev-date) ?line) (extract 2 #"[^\t]+" ?line :> ?date ?prev))
+			]
+			(doseq [curr-prev date-to-prev] 
+				(if (not (= " " (second curr-prev)))
+				(let[
+					current (first curr-prev)
+					previous (second curr-prev)
+					current-norms (<- [?word ?norm] ((hfs-textline (str matrix-loc "/" current)) ?line) 
+									(extract 2 #"[^\t]+" ?line :> ?word ?norm))
+					previous-norms (<- [?word ?norm] ((hfs-textline (str matrix-loc "/" previous)) ?line) 
+									(extract 2 #"[^\t]+" ?line :> ?word ?norm))
+					
+					]
+					(?<- (hfs-textline similarities-loc :sinkmode :append) [?date ?similarity]
+						(current-norms ?word ?curr-norm-str)
+						(previous-norms ?word ?prev-norm-str)
+						(to-double ?curr-norm-str :> ?curr-norm)
+						(to-double ?prev-norm-str :> ?prev-norm)
+						; (tuplerise ?curr-norm-str ?prev-norm-str :> ?norm-tuple-str)
+						(dot-product ?curr-norm ?prev-norm :> ?dp)
+						(magnitude-sq ?curr-norm :> ?curr-mag-sq)
+						(magnitude-sq ?prev-norm :> ?prev-mag-sq)
+						(sqrt ?curr-mag-sq :> ?curr-mag)
+						(sqrt ?prev-mag-sq :> ?prev-mag)
+						(cosine-sim ?dp ?curr-mag ?prev-mag :> ?similarity)
+						(identity current :> ?date)
+					)
+				)
+				)
+			)
+				
+			; (for [curr-prev date-to-prev] 
+			; 	(let[
+			; 		current (first curr-prev)
+			; 		previous (second curr-prev)
+			; 		current-norms (hfs-textline (str matrix-loc "/" current))
+			; 		previous-norms (hfs-textline (str matrix-loc "/" previous))
+			; 		]
+			; 	(?<- (hfs-textline similarities-loc :sinkmode :append) [?date ?similarity]
+			; 		(current-norms ?word ?curr-norm)
+			; 		(previous-norms ?word ?prev-norm)
+			; 		(dot-product ?curr-norm ?prev-norm :> ?dp)
+			; 		(magnitude-sq ?curr-norm :> ?curr-mag-sq)
+			; 		(magnitude-sq ?prev-norm :> ?prev-mag-sq)
+			; 		(sqrt ?curr-mag-sq :> ?curr-mag)
+			; 		(sqrt ?prev-mag-sq :> ?prev-mag)
+			; 		(cosine-sim ?dp ?curr-mag ?prev-mag :> ?similarity)
+			; 	)
+			; 	)
+			; )
+		)
+		)
+	)
+)
+
+; (defn -main [tweet-loc friendlyname]
+; 	(println (str "**Running tweet similarity workflow on " friendlyname ))
+; 	(let [
+; 		word-vector-loc (str "/user/maxdupenois/twitter-word-vectors/dated=" friendlyname)
+; 		similarities-loc (str "/user/maxdupenois/twitter-similarities/dated=" friendlyname)
+; 		]
+; 		(if  (not (hdp-path-exists? word-vector-loc)) 
+; 			(build-tweet-vector tweet-loc word-vector-loc)
+; 		)
+; 		(workflow ["/tmp/max/twitter_sim_tmp"]
+; 			stage-1 ([:tmp-dirs true-word-vec]
+; 				(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+; 				(let [word-vec (read-from-word-vec word-vector-loc)]
+; 					(?<- (hfs-textline true-word-vec) [?outline] ((fill-zeroes word-vec) ?word ?date ?norm) 
+; 					(str ?word "\t" ?date "\t" ?norm :> ?outline))
+; 				)
+; 				)
+; 			)
+; 			stage-2 ([:tmp-dirs date-to-prev-date]
+; 				(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+; 					(let [
+; 						word-vec (read-from-word-vec word-vector-loc)
+; 						dates (<- [?d] (word-vec ?d _ _ _ _) )
+; 						dummy-partial (<-  [?blank] ([" "] ?blank))
+; 						dates-lagged (union dates dummy-partial)
+; 						dates-lagged-indexed (index-dates-lagged dates-lagged)
+; 						dates-indexed (index-dates dates)
+; 						]
+; 						(?<- (hfs-textline date-to-prev-date) [?d1 ?d2] (dates-indexed ?d1 ?i) (dates-lagged-indexed ?d2 ?i))
+; 					)
+; 				)
+; 			)
+; 			stage-2i ([:deps stage-1 :tmp-dirs matrix-loc]
+; 				(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+; 					(let [word-vec (hfs-textline true-word-vec)] ;"/user/maxdupenois/test-template"
+; 						(?<- (hfs-textline matrix-loc :outfields ["?word" "?norm"] :templatefields "?date" :sink-template "%s") 
+; 						[?date ?word ?norm] (word-vec ?line)
+; 						(extract 3 #"[^\t]+" ?line :> ?word ?date ?norm)) 
+; 					)
+; 				)
+; 			)
+; 			final ([:deps :all ]
+; 				; Okay, all the norms have been dumped into files within matrix-loc directory named by date
+; 				; need to loop through all dates and their previous so:
+; 				; date-to-prev (??<- [?date ?prev] ((hfs-textline date-to-prev-date) ?line) (extract 2 #"[^\t]+" ?line :> ?date ?prev))
+; 				(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+; 				(let [
+; 					date-to-prev (??<- [?date ?prev] ((hfs-textline date-to-prev-date) ?line) (extract 2 #"[^\t]+" ?line :> ?date ?prev))
+; 					]
+; 					; (for [curr-prev date-to-prev] 
+; 					; 	(let[
+; 					; 		current (first curr-prev)
+; 					; 		previous (second curr-prev)
+; 					; 		current-norms (hfs-textline (str matrix-loc "/" current))
+; 					; 		previous-norms (hfs-textline (str matrix-loc "/" previous))
+; 					; 		]
+; 					; 	(?<- (hfs-textline similarities-loc :sinkmode :append) [?date ?similarity]
+; 					; 		(current-norms ?word ?curr-norm)
+; 					; 		(previous-norms ?word ?prev-norm)
+; 					; 		(dot-product ?curr-norm ?prev-norm :> ?dp)
+; 					; 		(magnitude-sq ?curr-norm :> ?curr-mag-sq)
+; 					; 		(magnitude-sq ?prev-norm :> ?prev-mag-sq)
+; 					; 		(sqrt ?curr-mag-sq :> ?curr-mag)
+; 					; 		(sqrt ?prev-mag-sq :> ?prev-mag)
+; 					; 		(cosine-sim ?dp ?curr-mag ?prev-mag :> ?similarity)
+; 					; 	)
+; 					; 	)
+; 					; )
+; 				)
+; 				)
+; 			)
+; 
+; 		)
+; 	)
+; )
+; 
+
+; stage-2i ([:deps stage-1 :tmp-dirs matrix-loc]
+; 	(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+; 		(let [word-vec (hfs-textline true-word-vec)]
+; 			(?<- (hfs-textline matrix-loc) [?date ?norms] (word-vec ?line)
+; 			(extract 3 #"[^\t]+" ?line :> ?word ?date ?norm) 
+; 			(join-norms ?norm :> ?norms) ) ;(str ?word "|" ?norm :> ?word-norm) : used to make sure the word order
+; 											;is the same
+; 		)
+; 	)
+; )
+; final ([:deps :all ]
+; 	(with-job-conf {"mapred.job.priority" "VERY_LOW"}
+; 		(let [
+; 			date-to-prev (<- [?date ?prev] ((hfs-textline date-to-prev-date) ?line) (extract 2 #"[^\t]+" ?line :> ?date ?prev))
+; 			; zeroed-vector  (<- [?word ?date ?norm] ((hfs-textline true-word-vec) ?line) (extract 3 #"[^\t]+" ?line :>  ?word ?date ?norm))
+; 			matrix  (<- [?date ?norms] ((hfs-textline matrix-loc) ?line) (extract 2 #"[^\t]+" ?line :> ?date ?norms))
+; 			norms-for-current (<- [?date ?norms] (date-to-prev ?date _) (matrix ?date ?norms ))
+; 			norms-for-prev (<- [?date ?norms] (date-to-prev ?date ?prev) (matrix ?prev ?norms ))
+; 			; magnitudes (<- [?date ?sum-sq] (zeroed-vector ?word ?date ?norm) (to-double ?norm :> ?dn)(sum-sq ?dn :> ?sum-sq))
+; 			]
+; 		(?<- (hfs-textline similarities-loc) [?date ?similarity] (norms-for-current ?date ?norms-current) 
+; 			(norms-for-prev ?date ?norms-prev) 
+; 			(cosine-similarity ?norms-current ?norms-prev :> ?similarity))
+; 		)
+; 	)	
+; )
+
+; 
+; 
+; 
+; ;dates (<- [?date] (word-vec ?date _ _ _ _))
+; ; (with-job-conf {"mapred.job.priority" "VERY_LOW"}
+; ; (let [word-vec (read-from-word-vec word-vector-loc)
+; ; 	true-word-vec (fill-zeroes word-vec)]
+; ; 	(?<- (hfs-textline "/user/maxdupenois/twitter-word-vec-sim/test") [?word ?date ?norm] ((fill-zeroes word-vec) ?word ?date ?norm))
+; ; )
+; ; )
+; ; (defn get-norms[word-vec word]
+; ; 	(<- [?word ?norms] (word-vec ?date ?word _ ?norm _) (= ?word word) (combine-norms ?norm :> ?norms))
+; ; 	)
+; (use 'cascalog.playground)(bootstrap)
+; (defmapop true-norm [n]
+; 	(if (nil? n) 
+; 	(identity "0.0") 
+; 	(identity n))
+; )
+; 
+; (defn combine-norms[norms norm] (str norms "\t" norm))
+; (defparallelagg join-norms :init-var #'identity :combine-var #'combine-norms)
+; 
+; (def join-test[                                                                 
+; 	["2012-01-01" "word0" "1.0"] 
+; 	["2012-01-01" "word1" "2.1"] 
+; 	["2012-01-01" "word2" "0.1"] 
+; 	["2012-01-02" "word0" "0.3"] 
+; 	["2012-01-02" "word2" "0.4"]
+; 	["2012-01-03" "word-u" "0.5"] 
+; ])
+; (defn words-for-dates [word-vec]
+; 	(let [
+; 		words (<- [?j ?w] (word-vec _ ?w _) (identity 1 :> ?j))
+; 		dates (<- [?j ?d] (word-vec ?d _ _) (identity 1 :> ?j))
+; 		]
+; 		(<- [!!w !!d] (words ?j !!w) (dates ?j !!d) ) 
+; 	)
+; )
+; (defn true-vec [word-vec]
+; 	(<- [?w ?d ?n] ((words-for-dates word-vec) ?w ?d) (word-vec ?d ?w !!na) (true-norm !!na :> ?n))
+; 	)
+; 
+; (defn matrix [word-vec]
+; 	(<- [?word ?norms] ((true-vec word-vec) ?word ?date ?norm)
+; 		(str ?date "|" ?norm :> ?d-n)
+; 		(join-norms ?d-n :> ?norms) )
+; 	) 
+; 
+; (defmapcatop split-tab [string]
+; 	(seq (.split string "\\t")))
+; 
+; (defn init-sum-sq [current]
+; 	(* current current)
+; )
+; (defn combine-sum-sq [current nxt]
+; 	(+ current (* nxt nxt))
+; )
+; (defparallelagg sum-sq :init-var #'init-sum-sq :combine-var #'combine-sum-sq)
+; (defmapop to-double [d] (Double/parseDouble d))
+; (defn magnitudes [word-vec]
+; 	(<- [?date ?sum-sq] ((true-vec word-vec) ?word ?date ?norm) (to-double ?norm :> ?dn)(sum-sq ?dn :> ?sum-sq))
+; )
+; (defmapop indexer {:stateful true}
+; 	([] 0)
+; 	([curr a] (+ curr 1))
+; 	([curr] curr)
+; )
+; 
+; (def joiner-natural-numbers (map vector (iterate identity "-") (iterate inc 1)))
+; (defn generator-joiner-natural-numbers [n]
+; 	(take n joiner-natural-numbers)
+; 	)
+; 
+; ; (defn dot-products [word-vec]
+; ; 	(let [
+; ; 		dates (<- [?d] (word-vec ?d _ _) )
+; ; 		dummy-start (<-  [?blank] ([" "] ?blank))
+; ; 		dates-lagged (union dates dummy-start)
+; ; 		dates-indexed (<- [?d ?i] (dates ?d) (indexer 1 :> ?i))
+; ; 		dates-lagged-indexed (<- [?d ?i] (dates-lagged ?d) (indexer 1 :> ?i))
+; ; 	]
+; ; 		(?<- (stdout) [?i ?d1 ?d2] (dates-indexed ?i ?d1)(dates-lagged-indexed ?i ?d2))
+; ; 		;(?<- (stdout) [?d] (dates-lagged ?d))
+; ; 	)
+; ; )
+; ; (dot-products join-test)
+; ;
+; ; dates-lagged-count (first (flatten (??- (<- [?c] (dates-lagged _) (c/count :> ?c)))))
+; ; (?<- (stdout) [?w ?a] ((matrix join-test) ?w ?n) (split-tab ?n :> ?a) )
+; 
+; ; (def dates (<- [?d] (join-test ?d _ _) ))
+; 
+; (defmapop get-i [d]
+; 	(def i (+ i 1))
+; 	(identity i)
+; )
+; (defmapop get-n [d]
+; 	(def n (+ n 1))
+; 	(identity n)
+; )
+; (defn index-dates[dates]
+; 	(def n 0)
+; 	(<- [?d ?i] (dates ?d) (get-n ?d :> ?i))
+; )
+; (defn index-dates-lagged[dates]
+; 	(def i 0)
+; 	(<- [?d ?i] (dates ?d) (get-i ?d :> ?i))
+; )
+; (let [
+; 	dates (<- [?d] (join-test ?d _ _) )
+; 	dummy-partial (<-  [?blank] ([" "] ?blank))
+; 	dates-lagged (union dates dummy-partial)
+; 	dates-lagged-indexed (index-dates-lagged dates-lagged)
+; 	dates-indexed (index-dates dates)
+; 	]
+; 	
+; 	;(?<- (stdout) [?j ?i ?x] (dates-lagged-indexed ?j ?i ?x)))
+; 	; (?<- (stdout) [?i ?d1] (dates-indexed ?d1 ?i) )
+; 	; 	(?<- (stdout) [?i ?d2] (dates-lagged-indexed ?d2 ?i))
+; 	(?<- (stdout) [?i ?d1 ?d2] (dates-indexed ?d1 ?i) (dates-lagged-indexed ?d2 ?i))
+; )
+; 
+; (??- (union (<-  [?blank] ([" "] ?blank)  (<- [?d] (join-test ?d _ _) ))))
+	
+; 
+; (defn words [src]
+; 	(<- [?w] (src _ ?w _))
+; 	)
+; (defn types [src]
+; 	(<- [?t] (src ?t _ _))
+; 	)
+; (defn words-for-type[src t]
+; 	(<- [?w] (src _ ?w ?t) (= ?t t))
+; 	)
+; (?- (stdout) (union (words join-test) (types join-test)))
+; 
+; 
+; (defn words-for-type [src]
+; (partition 2 (flatten (let [word-seq (first (??- (words src)))
+; 	type-seq  (first (??- (types src)))]
+; 	(for [w word-seq] (for [t type-seq] [(first w) (first t)]))
+; )))
+; )
+; (?<- (stdout) [?w ?t ?n] ((words-for-type join-test) ?w ?t) (join-test ?t ?w !!c) (true-norm !!c :> ?n) )
+
+
