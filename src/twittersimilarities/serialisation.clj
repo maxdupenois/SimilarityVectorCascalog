@@ -43,7 +43,7 @@
 
 (defn -main [& args]
     (let [seqtap (hfs-wrtseqfile "/user/maxdupenois/ser-deleteme"  Text  Text :outfields ["?id" "?w"] :sinkmode :replace)]
-      (?<- (seqtap) [?map] (testdata ?id ?w) (in-map ?id ?w :> ?map))
+      (?<- (seqtap) [?map] (testdata ?id ?w) )
     ))
 
 
